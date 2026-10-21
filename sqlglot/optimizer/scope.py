@@ -842,6 +842,19 @@ def _traverse_ctes(scope: Scope) -> Iterator[Scope]:
     sources: dict[str, exp.Table | Scope] = {}
 
     for cte in scope.ctes:
+        # A scalar CTE (ClickHouse's WITH <expr> AS x) names a value, not a relation, so it is
+        # never a source; a scalar subquery is scoped like any other subquery of this query
+        if cte.args.get("scalar"):
+            if isinstance(cte.this, exp.Query):
+                top: Scope | None = None
+                for top in _traverse_scope(
+                    scope.branch(cte.this, cte_sources=sources, scope_type=ScopeType.SUBQUERY)
+                ):
+                    yield top
+                if top is not None:
+                    scope.subquery_scopes.append(top)
+            continue
+
         cte_name = cte.alias
 
         # if the scope is a recursive cte, it must be in the form of base_case UNION recursive.

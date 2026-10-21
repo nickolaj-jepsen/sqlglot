@@ -2577,6 +2577,23 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
             level="warning",
         )
 
+    @patch("sqlglot.optimizer.scope.logger")
+    def test_scope_scalar_cte(self, logger):
+        sql = "WITH now() - INTERVAL 1 HOUR AS lo, 'x' AS y SELECT a FROM t WHERE ts > lo"
+        scopes = traverse_scope(parse_one(sql, read="clickhouse"))
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(set(scopes[0].sources), {"t"})
+        logger.warning.assert_not_called()
+
+        # A scalar subquery is a subquery of the query that defines it, not a source
+        sql = "WITH (SELECT max(b) FROM u) AS m SELECT a FROM t WHERE ts > m"
+        subquery, root = traverse_scope(parse_one(sql, read="clickhouse"))
+        self.assertEqual(subquery.expression.sql(), "SELECT MAX(b) FROM u")
+        self.assertTrue(subquery.is_subquery)
+        self.assertEqual(root.subquery_scopes, [subquery])
+        self.assertEqual(set(root.sources), {"t"})
+        logger.warning.assert_not_called()
+
     def test_traverse_set_operation_invalid_operand(self):
         for invalid_side, expression in (
             ("left", exp.Union(this=exp.column("a"), expression=exp.select("1"))),

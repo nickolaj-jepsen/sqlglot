@@ -1490,3 +1490,39 @@ SELECT X.$2 AS _COL_0 FROM UNKNOWN AS X(ALIAS_NAME);
 # execute: false
 SELECT * FROM y JOIN z USING (c, b);
 SELECT COALESCE(y.b, z.b) AS b, COALESCE(y.c, z.c) AS c FROM y AS y JOIN z AS z ON y.c = z.c AND y.b = z.b;
+
+# title: ClickHouse scalar CTEs expand in their own query, where they shadow columns and may use each other
+# dialect: clickhouse
+# execute: false
+WITH b + 1 AS d, d * 2 AS e, 5 AS b SELECT a, b, e FROM x WHERE d > 0;
+SELECT x.a AS a, 5 AS b, (5 + 1) * 2 AS e FROM x AS x WHERE (5 + 1) > 0;
+
+# title: ClickHouse scalar CTEs expand in a sibling CTE, where its own columns shadow them
+# dialect: clickhouse
+# execute: false
+WITH 5 AS b, 1 AS one, s AS (SELECT a + one AS v, b FROM x) SELECT v, b FROM s;
+WITH s AS (SELECT x.a + 1 AS v, x.b AS b FROM x AS x) SELECT s.v AS v, 5 AS b FROM s AS s;
+
+# title: ClickHouse scalar CTEs resolve their columns where they are used
+# dialect: clickhouse
+# execute: false
+WITH c + 1 AS d SELECT (SELECT d FROM y) AS r FROM x;
+SELECT (SELECT y.c + 1 AS d FROM y AS y) AS r FROM x AS x;
+
+# title: ClickHouse scalar subquery CTEs are values, not sources
+# dialect: clickhouse
+# execute: false
+WITH (SELECT MAX(b) FROM y) AS m SELECT a + m AS r FROM x;
+SELECT x.a + (SELECT MAX(y.b) AS _col_0 FROM y AS y) AS r FROM x AS x;
+
+# title: ClickHouse scalar CTEs on a set operation expand in each branch
+# dialect: clickhouse
+# execute: false
+WITH 5 AS k SELECT k FROM x UNION ALL SELECT k FROM y;
+SELECT 5 AS k FROM x AS x UNION ALL SELECT 5 AS k FROM y AS y;
+
+# title: ClickHouse scalar CTE integers don't become positional ORDER BY or GROUP BY keys
+# dialect: clickhouse
+# execute: false
+WITH 2 AS k SELECT k, COUNT() AS n FROM x GROUP BY k ORDER BY k;
+SELECT 2 AS k, COUNT() AS n FROM x AS x GROUP BY CAST(2 AS Int32) ORDER BY CAST(2 AS Int32);
