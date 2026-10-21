@@ -843,12 +843,12 @@ def _traverse_ctes(scope: Scope) -> Iterator[Scope]:
 
     for cte in scope.ctes:
         # A scalar CTE (ClickHouse's WITH <expr> AS x) names a value, not a relation, so it is
-        # never a source; a scalar subquery is scoped like any other subquery of this query
+        # never a source; subqueries in it are scoped like any other subquery of this query
         if cte.args.get("scalar"):
-            if isinstance(cte.this, exp.Query):
+            for query in find_all_in_scope(cte.this, *exp.UNWRAPPED_QUERIES):
                 top: Scope | None = None
                 for top in _traverse_scope(
-                    scope.branch(cte.this, cte_sources=sources, scope_type=ScopeType.SUBQUERY)
+                    scope.branch(query, cte_sources=sources, scope_type=ScopeType.SUBQUERY)
                 ):
                     yield top
                 if top is not None:

@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect, DialectType
 from sqlglot.helper import is_date_unit, is_iso_date, is_iso_datetime
 from sqlglot.optimizer.annotate_types import TypeAnnotator
+from sqlglot.optimizer.simplify import is_positional_key
 
 
 def canonicalize(expression: exp.Expr, dialect: DialectType = None) -> exp.Expr:
@@ -132,6 +133,7 @@ def remove_redundant_casts(expression: exp.Expr) -> exp.Expr:
         isinstance(expression, exp.Cast)
         and expression.this.type
         and expression.to == expression.this.type
+        and not (expression.this.is_int and is_positional_key(expression))
     ):
         return expression.this
 

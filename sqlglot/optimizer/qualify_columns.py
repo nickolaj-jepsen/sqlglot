@@ -18,12 +18,14 @@ from sqlglot.optimizer.scope import (
     traverse_scope,
     walk_in_scope,
 )
-from sqlglot.optimizer.simplify import simplify_parens
+from sqlglot.optimizer.simplify import is_positional_key, simplify_parens
 from sqlglot.schema import Schema, ensure_schema
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
     from collections.abc import Iterable
+
+_SCALAR_CTE_REFERENCED = "scalar_cte_referenced"
 
 
 def qualify_columns(
@@ -59,16 +61,20 @@ def qualify_columns(
     Notes:
         - A source may carry a chain of (UN)PIVOT operators; each one is resolved against
           the output of the one before it, and the last one's alias names the result
+        - Scalar CTEs (ClickHouse's WITH <expr> AS x) are expanded regardless of
+          `expand_alias_refs`, since nothing else resolves their names
     """
     schema = ensure_schema(schema, dialect=dialect)
     annotator = TypeAnnotator(schema)
     dialect = schema.dialect or Dialect()
     pseudocolumns = dialect.PSEUDOCOLUMNS
 
-    if expand_alias_refs:
-        _expand_scalar_ctes(expression, schema, dialect, annotator)
+    scopes = traverse_scope(expression)
+    if any(cte.args.get("scalar") for scope in scopes for cte in scope.ctes):
+        _expand_scalar_ctes(expression, scopes, schema, dialect, annotator)
+        scopes = traverse_scope(expression)
 
-    for scope in traverse_scope(expression):
+    for scope in scopes:
         if dialect.PREFER_CTE_ALIAS_COLUMN:
             pushdown_cte_alias_columns(scope)
 
@@ -429,11 +435,7 @@ def _expand_alias_refs(
                         replaced = True
                 else:
                     replaced = True
-                    column = column.replace(exp.paren(alias_expr))
-                    simplified = simplify_parens(column, dialect)
-                    if simplified is not column:
-                        column.replace(simplified)
-                        column = simplified
+                    column = _replace_parenthesized(column, alias_expr, dialect)
 
                     if resolve_table:
                         # Qualify any unqualified columns inside the spliced alias expression.
@@ -505,86 +507,113 @@ def _expand_alias_refs(
         scope.clear_cache()
 
 
+def _replace_parenthesized(node: exp.Expr, expression: exp.Expr, dialect: Dialect) -> exp.Expr:
+    replacement = node.replace(exp.paren(expression))
+    simplified = simplify_parens(replacement, dialect)
+    if simplified is not replacement:
+        replacement.replace(simplified)
+    return simplified
+
+
 def _expand_scalar_ctes(
-    expression: exp.Expr, schema: Schema, dialect: Dialect, annotator: TypeAnnotator
+    expression: exp.Expr,
+    scopes: list[Scope],
+    schema: Schema,
+    dialect: Dialect,
+    annotator: TypeAnnotator,
 ) -> None:
     """
-    Inline scalar CTEs (ClickHouse's WITH <expr> AS x), which act as macros, and drop them.
+    Inline scalar CTEs (ClickHouse's WITH <expr> AS x), which act as macros, where their names
+    are used, then drop the definitions nothing refers to any more.
 
     Example:
         WITH y.foo + 1 AS bar SELECT bar * 2 AS baz FROM y
      => SELECT (y.foo + 1) * 2 AS baz FROM y
 
-    The name shadows columns in the query that defines it, but in a nested query (a subquery,
-    CTE or derived table) a column of that query's own sources shadows the name.
+    A name shadows columns in the query that defines it. In a nested query (a subquery, CTE or
+    derived table) that query's own columns and aliases shadow the name, and within its own
+    expansion a name means the column. A use that isn't a plain name, e.g. tp.1 or f(x), keeps
+    the definition.
     """
-    scalar_ctes = [cte for cte in expression.find_all(exp.CTE) if cte.args.get("scalar")]
-    if not scalar_ctes:
-        return
+    for scope in scopes:
+        own, inherited = _visible_scalar_ctes(scope)
+        if not own and not inherited:
+            continue
 
-    # Each pass expands one level of names used in other definitions, so more passes than
-    # definitions means a cycle, which is left unexpanded
-    for _ in range(len(scalar_ctes) + 1):
-        expanded = False
+        if inherited:
+            shadowing = _source_columns(scope, schema)
+            if shadowing is not None:
+                if isinstance(scope.expression, exp.Select):
+                    shadowing.update(
+                        s.alias for s in scope.expression.selects if isinstance(s, exp.Alias)
+                    )
+                inherited = {name: cte for name, cte in inherited.items() if name not in shadowing}
 
-        for scope in traverse_scope(expression):
-            own, inherited = _visible_scalar_ctes(scope)
-            if not own and not inherited:
-                continue
+        expanding = set()
+        node = scope.expression.parent
+        while node:
+            if isinstance(node, exp.CTE) and node.args.get("scalar"):
+                expanding.add(node.alias)
+            node = node.parent
 
-            local_columns = Resolver(scope, schema).all_columns if inherited else set()
+        _expand_scalar_cte_refs(
+            scope.expression,
+            {**inherited, **own},
+            set(scope.sources),
+            expanding,
+            dialect,
+            annotator,
+        )
 
-            for column in list(scope.find_all(exp.Column)):
-                if column.table:
-                    continue
-
-                definition = own.get(column.name)
-                if definition is None and column.name not in local_columns:
-                    definition = inherited.get(column.name)
-                if definition is None:
-                    continue
-
-                name = column.this
-                is_projection = (
-                    isinstance(column.parent, exp.Select) and column.arg_key == "expressions"
-                )
-                is_positional_key = _is_positional_key(column)
-
-                expansion: exp.Expr = column.replace(exp.paren(definition.copy()))
-                simplified = simplify_parens(expansion, dialect)
-                if simplified is not expansion:
-                    expansion = expansion.replace(simplified)
-
-                if is_positional_key and expansion.is_int:
-                    # A bare integer here would be read as a position, e.g. ORDER BY 2
-                    type_ = annotator.annotate(expansion.copy(), annotate_scope=False).type
-                    type_ = (type_ or exp.DataType.build("INT")).copy()
-                    type_.set("nullable", False)
-                    expansion = expansion.replace(exp.cast(expansion.copy(), type_))
-                if is_projection:
-                    expansion.replace(alias(expansion.copy(), name))
-
-                expanded = True
-
-        if not expanded:
-            break
-
-    for cte in scalar_ctes:
-        with_ = cte.parent
-        cte.pop()
-        if isinstance(with_, exp.With) and not with_.expressions:
-            with_.pop()
+    for cte in list(expression.find_all(exp.CTE)):
+        if cte.args.get("scalar") and not cte.meta.pop(_SCALAR_CTE_REFERENCED, False):
+            with_ = cte.parent
+            cte.pop()
+            if isinstance(with_, exp.With) and not with_.expressions:
+                with_.pop()
 
 
-def _is_positional_key(node: exp.Expr) -> bool:
-    """Whether `node` is a whole GROUP BY, ORDER BY or LIMIT BY key of a query."""
-    parent = node.parent
-    if isinstance(parent, exp.Ordered):
-        return isinstance(parent.parent, exp.Order) and isinstance(parent.parent.parent, exp.Query)
-    return isinstance(parent, (exp.Group, exp.Limit)) and node.arg_key == "expressions"
+def _expand_scalar_cte_refs(
+    node: exp.Expr,
+    ctes: dict[str, exp.CTE],
+    sources: set[str],
+    expanding: set[str],
+    dialect: Dialect,
+    annotator: TypeAnnotator,
+) -> None:
+    for ref in list(walk_in_scope(node)):
+        if isinstance(ref, exp.Anonymous):
+            if (cte := ctes.get(ref.name)) and ref.name not in expanding:
+                cte.meta[_SCALAR_CTE_REFERENCED] = True
+            continue
+        if not isinstance(ref, exp.Column):
+            continue
+
+        name = ref.parts[0].name
+        cte = ctes.get(name)
+        if not cte or name in expanding:
+            continue
+        if ref.table:
+            if name not in sources:
+                cte.meta[_SCALAR_CTE_REFERENCED] = True
+            continue
+
+        is_projection = isinstance(ref.parent, exp.Select) and ref.arg_key == "expressions"
+        is_key = is_positional_key(ref)
+
+        expansion = _replace_parenthesized(ref, cte.this, dialect)
+        if is_key and expansion.is_int:
+            type_ = annotator.annotate(expansion.copy(), annotate_scope=False).type
+            type_ = (type_ or exp.DataType.build("INT")).copy()
+            type_.set("nullable", False)
+            expansion = expansion.replace(exp.cast(expansion, type_))
+        if is_projection:
+            expansion = expansion.replace(alias(expansion, ref.this))
+
+        _expand_scalar_cte_refs(expansion, ctes, sources, expanding | {name}, dialect, annotator)
 
 
-def _visible_scalar_ctes(scope: Scope) -> tuple[dict[str, exp.Expr], dict[str, exp.Expr]]:
+def _visible_scalar_ctes(scope: Scope) -> tuple[dict[str, exp.CTE], dict[str, exp.CTE]]:
     """
     The scalar CTEs a scope can reference, by name.
 
@@ -592,8 +621,8 @@ def _visible_scalar_ctes(scope: Scope) -> tuple[dict[str, exp.Expr], dict[str, e
         Those defined by the scope's own query, including a set operation it is a branch of,
         and those inherited from enclosing queries. Inner definitions win.
     """
-    own: dict[str, exp.Expr] = {}
-    inherited: dict[str, exp.Expr] = {}
+    own: dict[str, exp.CTE] = {}
+    inherited: dict[str, exp.CTE] = {}
     names = own
     current: Scope | None = scope
 
@@ -601,14 +630,33 @@ def _visible_scalar_ctes(scope: Scope) -> tuple[dict[str, exp.Expr], dict[str, e
         with_ = current.expression.args.get("with_")
         for cte in with_.expressions if with_ else []:
             if cte.args.get("scalar"):
-                names.setdefault(cte.alias, cte.this)
+                names.setdefault(cte.alias, cte)
 
         parent = current.parent
         if not (parent and isinstance(parent.expression, exp.SetOperation)):
             names = inherited
         current = parent
 
-    return own, {name: e for name, e in inherited.items() if name not in own}
+    return own, {name: cte for name, cte in inherited.items() if name not in own}
+
+
+def _source_columns(scope: Scope, schema: Schema) -> set[str] | None:
+    """The columns of a scope's sources, seeing through SELECT *, or None if any are unknown."""
+    resolver = Resolver(scope, schema)
+    names: set[str] = set()
+
+    for name, (_, source) in scope.selected_sources.items():
+        columns = resolver.get_source_columns(name)
+        if "*" in columns:
+            inner = _source_columns(source, schema) if isinstance(source, Scope) else None
+            if inner is None:
+                return None
+            names.update(inner)
+        elif not columns:
+            return None
+        names.update(column for column in columns if column != "*")
+
+    return names
 
 
 def _expand_group_by(scope: Scope, dialect: Dialect, annotator: TypeAnnotator) -> None:

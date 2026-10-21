@@ -2116,3 +2116,8 @@ a IS DISTINCT FROM b BETWEEN 0 AND 1;
 # dialect: sqlite
 a IS NOT DISTINCT FROM b NOT BETWEEN 0 AND 1;
 (a IS NOT DISTINCT FROM b) < 0 OR (a IS NOT DISTINCT FROM b) > 1;
+
+# title: a whole ORDER BY or LIMIT BY key isn't folded into a positional reference
+# dialect: clickhouse
+SELECT a, b FROM x ORDER BY 1 + 1, (2), a + (1 + 1) LIMIT 1 BY 1 + 1;
+SELECT a, b FROM x ORDER BY 1 + 1, (2), a + 2 LIMIT 1 BY 1 + 1;

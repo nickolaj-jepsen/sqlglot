@@ -142,6 +142,18 @@ def _is_pure_mul_chain(node: exp.Expr) -> bool:
     return True
 
 
+def is_positional_key(expression: exp.Expr) -> bool:
+    """
+    Whether `expression` is a whole ORDER BY, GROUP BY or LIMIT BY key of a query, where an
+    integer literal means a projection's position, so rewriting the key into one changes it.
+    """
+    parent = expression.parent
+    if isinstance(parent, exp.Ordered):
+        order = parent.parent
+        return isinstance(order, exp.Order) and isinstance(order.parent, exp.Query)
+    return isinstance(parent, (exp.Group, exp.Limit)) and expression.arg_key == "expressions"
+
+
 def simplify_parens(expression: exp.Expr, dialect: DialectType) -> exp.Expr:
     if not isinstance(expression, exp.Paren):
         return expression
@@ -708,10 +720,17 @@ class Simplifier:
                             break
 
             if isinstance(node, exp.Condition):
+                positional_key = (
+                    node.copy()
+                    if not node.is_int and is_positional_key(node) and not node.find(exp.Column)
+                    else None
+                )
                 simplified = while_changing(
                     t.cast(exp.Expr, node),
                     lambda e: self._simplify(e, constant_propagation, coalesce_simplification),
                 )
+                if positional_key and simplified.is_int:
+                    simplified = simplified.replace(positional_key)
 
                 if node is expression:
                     expression = simplified

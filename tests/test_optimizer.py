@@ -2594,6 +2594,27 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         self.assertEqual(set(root.sources), {"t"})
         logger.warning.assert_not_called()
 
+        sql = "WITH (SELECT max(b) FROM u) + 1 AS m SELECT a FROM t WHERE ts > m"
+        subquery, root = traverse_scope(parse_one(sql, read="clickhouse"))
+        self.assertEqual(subquery.expression.sql(), "SELECT MAX(b) FROM u")
+        self.assertEqual(set(root.sources), {"t"})
+
+        query = exp.select("a + k").from_("t").with_("k", as_="1", scalar=True)
+        self.assertEqual(len(traverse_scope(query)), 1)
+        logger.warning.assert_not_called()
+
+    def test_qualify_scalar_cte_without_alias_expansion(self):
+        expression = parse_one("WITH 5 AS k SELECT a + k AS r FROM t", read="clickhouse")
+        self.assertEqual(
+            optimizer.qualify.qualify(
+                expression,
+                schema={"t": {"a": "INT"}},
+                dialect="clickhouse",
+                expand_alias_refs=False,
+            ).sql("clickhouse"),
+            'SELECT "t"."a" + 5 AS "r" FROM "t" AS "t"',
+        )
+
     def test_traverse_set_operation_invalid_operand(self):
         for invalid_side, expression in (
             ("left", exp.Union(this=exp.column("a"), expression=exp.select("1"))),

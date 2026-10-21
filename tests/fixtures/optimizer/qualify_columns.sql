@@ -1526,3 +1526,46 @@ SELECT 5 AS k FROM x AS x UNION ALL SELECT 5 AS k FROM y AS y;
 # execute: false
 WITH 2 AS k SELECT k, COUNT() AS n FROM x GROUP BY k ORDER BY k;
 SELECT 2 AS k, COUNT() AS n FROM x AS x GROUP BY CAST(2 AS Int32) ORDER BY CAST(2 AS Int32);
+
+# title: ClickHouse scalar CTE integers don't become positional LIMIT BY keys, even through another name
+# dialect: clickhouse
+# execute: false
+WITH 2 AS k, k AS j SELECT a FROM x ORDER BY j LIMIT 1 BY k;
+SELECT x.a AS a FROM x AS x ORDER BY CAST(2 AS Int32) LIMIT 1 BY CAST(2 AS Int32);
+
+# title: ClickHouse scalar CTE names mean the column within their own expansion
+# dialect: clickhouse
+# execute: false
+WITH a + 1 AS a SELECT a FROM x;
+SELECT x.a + 1 AS a FROM x AS x;
+
+# title: ClickHouse scalar CTEs that reference each other resolve the cycle to the column
+# dialect: clickhouse
+# execute: false
+WITH b AS a, a AS b SELECT a FROM x;
+SELECT x.a AS a FROM x AS x;
+
+# title: ClickHouse scalar CTEs are shadowed by the columns of a nested query's SELECT * source
+# dialect: clickhouse
+# execute: false
+WITH 5 AS b SELECT v FROM (SELECT b AS v FROM (SELECT * FROM x) AS d) AS e;
+SELECT e.v AS v FROM (SELECT d.b AS v FROM (SELECT x.a AS a, x.b AS b FROM x AS x) AS d) AS e;
+
+# title: ClickHouse scalar CTEs are shadowed by a nested query's own aliases
+# dialect: clickhouse
+# execute: false
+WITH 5 AS k SELECT j FROM (SELECT b * 10 AS k, k + 1 AS j FROM y) AS e;
+SELECT e.j AS j FROM (SELECT y.b * 10 AS k, y.b * 10 + 1 AS j FROM y AS y) AS e;
+
+# title: ClickHouse scalar CTEs keep their subqueries when expanded
+# dialect: clickhouse
+# execute: false
+WITH (SELECT MAX(c) FROM y) + 1 AS m SELECT a + m AS r FROM x;
+SELECT x.a + (SELECT MAX(y.c) AS _col_0 FROM y AS y) + 1 AS r FROM x AS x;
+
+# title: ClickHouse scalar CTEs used through tuple access are kept
+# dialect: clickhouse
+# execute: false
+# validate_qualify_columns: false
+WITH (1, 2) AS tp SELECT tp.1 AS r FROM x;
+WITH (1, 2) AS tp SELECT tp.1 AS r FROM x AS x;

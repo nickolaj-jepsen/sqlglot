@@ -138,3 +138,12 @@ DATE_TRUNC('YEAR', CAST('2023-01-01' AS DATE));
 
 DATE(DATE_TRUNC('YEAR', CAST("x" AS DATE)));
 DATE_TRUNC('YEAR', CAST("x" AS DATE));
+
+# title: a cast in a whole GROUP BY or ORDER BY key isn't removed when that leaves a positional reference
+SELECT a, COUNT(*) AS n FROM x GROUP BY a, CAST(2 AS INT) ORDER BY CAST(1 AS INT);
+SELECT "x"."a" AS "a", COUNT(*) AS "n" FROM "x" AS "x" GROUP BY "x"."a", CAST(2 AS INT) ORDER BY CAST(1 AS INT);
+
+# title: a ClickHouse scalar CTE integer stays a constant key through the whole optimizer
+# dialect: clickhouse
+WITH 2 AS k SELECT k, COUNT() AS n FROM x GROUP BY k ORDER BY k;
+SELECT 2 AS "k", COUNT() AS "n" FROM "x" AS "x" GROUP BY CAST(2 AS Int32) ORDER BY CAST(2 AS Int32);
